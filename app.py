@@ -1,91 +1,100 @@
 import streamlit as st
-from PyPDF2 import PdfReader
+import PyPDF2
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 import torch
 import re
 
-st.set_page_config(page_title="PDF Q&A Bot", layout="centered")
-st.title("📄 PDF Question Answering Bot")
-st.write("Upload a PDF and ask questions like *definition, example, overview, or summary*. Answers are limited to **10 lines**.")
+# ------------------ Streamlit UI ------------------
+st.set_page_config(page_title="PDF Question Answer Bot", layout="wide")
+st.title("📄 PDF Question Answering Bot (Open Source LLM)")
 
+uploaded_file = st.file_uploader("Upload a PDF file", type=["pdf"])
+
+# ------------------ Load LLM ------------------
 @st.cache_resource
-def load_model():
-    model_name = "google/flan-t5-base"
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+def load_llm():
+    tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-base")
+    model = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-base")
     return tokenizer, model
 
-@st.cache_data
+tokenizer, model = load_llm()
+
+# ------------------ Read PDF ------------------
 def read_pdf(file):
-    reader = PdfReader(file)
+    reader = PyPDF2.PdfReader(file)
     text = ""
     for page in reader.pages:
-        if page.extract_text():
-            text += page.extract_text() + "\n"
+        page_text = page.extract_text()
+        if page_text:
+            text += page_text + "\n"
     return text.strip()
 
-# Intent detection
-def detect_intent(question):
-    q = question.lower()
-    if any(k in q for k in ["summary", "overview", "summarize"]):
-        return "summary"
-    return "qa"
+# ------------------ Clean Text ------------------
+def clean_text(text):
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
-# Basic relevance check
-def is_relevant(question, context):
-    keywords = re.findall(r"\b\w{4,}\b", question.lower())
-    matches = sum(1 for k in keywords if k in context.lower())
-    return matches >= max(1, len(keywords) // 5)
+# ------------------ Relevance Filtering ------------------
+def get_relevant_text(pdf_text, question):
+    question_words = set(re.findall(r"\w+", question.lower()))
+    sentences = re.split(r'(?<=[.!?]) +', pdf_text)
 
-# Generate answer
-def generate_answer(tokenizer, model, prompt, max_tokens=256):
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_tokens,
-            temperature=0.3
-        )
+    relevant = []
+    for sent in sentences:
+        sent_words = set(re.findall(r"\w+", sent.lower()))
+        if len(question_words.intersection(sent_words)) >= 2:
+            relevant.append(sent)
+
+    return " ".join(relevant[:30])  # limit size
+
+# ------------------ LLM Answer ------------------
+def generate_answer(context, question):
+    prompt = f"""
+Use the following context to answer the question.
+If the answer is not present, say "Answer not found in the document".
+
+Context:
+{context}
+
+Question:
+{question}
+
+Answer (explain in about 10 lines):
+"""
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=300,
+        temperature=0.3
+    )
     return tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-uploaded_file = st.file_uploader("Upload PDF", type=["pdf"])
-
+# ------------------ Main Logic ------------------
 if uploaded_file:
-    try:
-        document_text = read_pdf(uploaded_file)
+    with st.spinner("Reading PDF..."):
+        pdf_text = read_pdf(uploaded_file)
+        pdf_text = clean_text(pdf_text)
+
+    if not pdf_text:
+        st.error("❌ Could not extract text from the PDF.")
+    else:
         st.success("✅ PDF loaded successfully")
-    except Exception as e:
-        st.error(f"❌ Failed to load PDF: {e}")
-        st.stop()
 
-    question = st.text_input("Ask a question")
+        question = st.text_input("Ask any question from the PDF:")
 
-    if question:
-        tokenizer, model = load_model()
-        intent = detect_intent(question)
+        if question:
+            lower_q = question.lower()
 
-        if intent == "summary":
-            prompt = (
-                "Summarize the following document in at most 10 lines:\n\n"
-                f"{document_text}"
-            )
-            answer = generate_answer(tokenizer, model, prompt)
-            st.subheader("📘 Summary")
-            st.write(answer)
+            with st.spinner("Thinking..."):
+                # -------- SUMMARY / OVERVIEW --------
+                if any(word in lower_q for word in ["summary", "overview", "summarize"]):
+                    context = pdf_text[:4000]  # full document summary
+                else:
+                    context = get_relevant_text(pdf_text, question)
 
-        else:
-            if not is_relevant(question, document_text):
-                st.warning("⚠️ Answer not found in the document.")
-            else:
-                prompt = (
-                    "Answer the question strictly using the document below. "
-                    "If the answer is not present, say 'Answer not found in the document.' "
-                    "Limit the answer to 10 lines.\n\n"
-                    f"Document:\n{document_text}\n\n"
-                    f"Question: {question}"
-                )
-                answer = generate_answer(tokenizer, model, prompt)
-                st.subheader("✍️ Answer")
-                st.write(answer)
-else:
-    st.info("👆 Upload a PDF to get started")
+                if not context.strip():
+                    st.warning("❌ Answer not found in the document.")
+                else:
+                    answer = generate_answer(context, question)
+                    st.write("### ✅ Answer")
+                    st.write(answer)
