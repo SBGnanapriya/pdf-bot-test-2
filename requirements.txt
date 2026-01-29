@@ -1,5 +1,6 @@
 streamlit
 PyPDF2
-transformers
 torch
+transformers
+sentence-transformers
 sentencepiece
