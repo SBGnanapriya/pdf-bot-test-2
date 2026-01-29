@@ -92,3 +92,4 @@ if uploaded_file:
 
                 st.write("### ✅ Answer")
                 st.write(answer)
+                st.write(pdf_text[:1000])
