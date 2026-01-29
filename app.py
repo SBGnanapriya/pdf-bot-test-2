@@ -1,57 +1,54 @@
 import streamlit as st
 import PyPDF2
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 import torch
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from sentence_transformers import SentenceTransformer, util
 import re
 
-# ------------------ Streamlit UI ------------------
-st.set_page_config(page_title="PDF Question Answer Bot", layout="wide")
-st.title("📄 PDF Question Answering Bot (Open Source LLM)")
+# ---------------- UI ----------------
+st.set_page_config(page_title="PDF Q&A Bot", layout="wide")
+st.title("📘 PDF Question Answer Bot")
 
-uploaded_file = st.file_uploader("Upload a PDF file", type=["pdf"])
+uploaded_file = st.file_uploader("Upload PDF", type="pdf")
 
-# ------------------ Load LLM ------------------
+# ---------------- Load Models ----------------
 @st.cache_resource
-def load_llm():
+def load_models():
+    embedder = SentenceTransformer("all-MiniLM-L6-v2")
     tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-base")
-    model = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-base")
-    return tokenizer, model
+    llm = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-base")
+    return embedder, tokenizer, llm
 
-tokenizer, model = load_llm()
+embedder, tokenizer, llm = load_models()
 
-# ------------------ Read PDF ------------------
+# ---------------- PDF Reader ----------------
 def read_pdf(file):
     reader = PyPDF2.PdfReader(file)
     text = ""
     for page in reader.pages:
-        page_text = page.extract_text()
-        if page_text:
-            text += page_text + "\n"
-    return text.strip()
+        if page.extract_text():
+            text += page.extract_text() + "\n"
+    return text
 
-# ------------------ Clean Text ------------------
-def clean_text(text):
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+# ---------------- Chunking ----------------
+def chunk_text(text, chunk_size=500):
+    sentences = re.split(r'(?<=[.!?]) +', text)
+    chunks, current = [], ""
+    for s in sentences:
+        if len(current) + len(s) < chunk_size:
+            current += " " + s
+        else:
+            chunks.append(current.strip())
+            current = s
+    if current:
+        chunks.append(current.strip())
+    return chunks
 
-# ------------------ Relevance Filtering ------------------
-def get_relevant_text(pdf_text, question):
-    question_words = set(re.findall(r"\w+", question.lower()))
-    sentences = re.split(r'(?<=[.!?]) +', pdf_text)
-
-    relevant = []
-    for sent in sentences:
-        sent_words = set(re.findall(r"\w+", sent.lower()))
-        if len(question_words.intersection(sent_words)) >= 2:
-            relevant.append(sent)
-
-    return " ".join(relevant[:30])  # limit size
-
-# ------------------ LLM Answer ------------------
+# ---------------- Answer Generation ----------------
 def generate_answer(context, question):
     prompt = f"""
-Use the following context to answer the question.
-If the answer is not present, say "Answer not found in the document".
+Use the context below to answer the question.
+If the answer is not present, say: Answer not found in the document.
 
 Context:
 {context}
@@ -59,42 +56,39 @@ Context:
 Question:
 {question}
 
-Answer (explain in about 10 lines):
+Answer in about 10 lines:
 """
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)
-    outputs = model.generate(
-        **inputs,
-        max_new_tokens=300,
-        temperature=0.3
-    )
-    return tokenizer.decode(outputs[0], skip_special_tokens=True)
+    output = llm.generate(**inputs, max_new_tokens=300)
+    return tokenizer.decode(output[0], skip_special_tokens=True)
 
-# ------------------ Main Logic ------------------
+# ---------------- MAIN ----------------
 if uploaded_file:
     with st.spinner("Reading PDF..."):
         pdf_text = read_pdf(uploaded_file)
-        pdf_text = clean_text(pdf_text)
 
-    if not pdf_text:
-        st.error("❌ Could not extract text from the PDF.")
-    else:
-        st.success("✅ PDF loaded successfully")
+    if not pdf_text.strip():
+        st.error("❌ Could not extract text from PDF")
+        st.stop()
 
-        question = st.text_input("Ask any question from the PDF:")
+    chunks = chunk_text(pdf_text)
+    chunk_embeddings = embedder.encode(chunks, convert_to_tensor=True)
 
-        if question:
-            lower_q = question.lower()
+    st.success("✅ PDF loaded and indexed")
 
-            with st.spinner("Thinking..."):
-                # -------- SUMMARY / OVERVIEW --------
-                if any(word in lower_q for word in ["summary", "overview", "summarize"]):
-                    context = pdf_text[:4000]  # full document summary
-                else:
-                    context = get_relevant_text(pdf_text, question)
+    question = st.text_input("Ask any question:")
 
-                if not context.strip():
-                    st.warning("❌ Answer not found in the document.")
-                else:
-                    answer = generate_answer(context, question)
-                    st.write("### ✅ Answer")
-                    st.write(answer)
+    if question:
+        with st.spinner("Searching document..."):
+            q_embedding = embedder.encode(question, convert_to_tensor=True)
+            scores = util.cos_sim(q_embedding, chunk_embeddings)[0]
+            top_results = torch.topk(scores, k=3)
+
+            if top_results.values[0] < 0.2:
+                st.warning("❌ Answer not found in the document.")
+            else:
+                context = "\n".join([chunks[i] for i in top_results.indices])
+                answer = generate_answer(context, question)
+
+                st.write("### ✅ Answer")
+                st.write(answer)
